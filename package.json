@@ -1,0 +1,28 @@
+{
+    "name": "github-project-discord-notifier",
+    "version": "1.0.0",
+    "description": "Discord bot that notifies users about GitHub Project Management ticket deadlines",
+    "main": "github-discord-bot.js",
+    "scripts": {
+      "start": "node github-discord-bot.js",
+      "dev": "nodemon github-discord-bot.js"
+    },
+    "keywords": [
+      "discord",
+      "bot",
+      "github",
+      "notifications",
+      "project-management"
+    ],
+    "author": "",
+    "license": "MIT",
+    "dependencies": {
+      "discord.js": "^14.14.1",
+      "@octokit/rest": "^20.0.2",
+      "node-cron": "^3.0.3",
+      "dotenv": "^16.3.1"
+    },
+    "devDependencies": {
+      "nodemon": "^3.0.2"
+    }
+  }

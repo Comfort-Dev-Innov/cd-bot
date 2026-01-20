@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, Events } = require('discord.js');
 const { Octokit } = require('@octokit/rest');
 const cron = require('node-cron');
 const fs = require('fs');
@@ -8,7 +8,9 @@ const path = require('path');
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
-const GITHUB_ORG = process.env.GITHUB_ORG;
+// NOTE: This must be the GitHub *login/slug* (the bit in the URL), not the display name.
+// Supports both organization-owned and user-owned Projects V2.
+const GITHUB_OWNER = process.env.GITHUB_OWNER || process.env.GITHUB_ORG;
 const PROJECT_NUMBER = process.env.PROJECT_NUMBER;
 
 // Initialize clients
@@ -58,85 +60,123 @@ function savePreviousAssignments() {
 }
 
 async function getProjectItems() {
-    try {
-        // Get project ID
-        const { data: project } = await octokit.graphql(`
-            query($org: String!, $number: Int!) {
-                organization(login: $org) {
-                    projectV2(number: $number) {
-                        id
-                        items(first: 100) {
-                            nodes {
-                                id
-                                fieldValues(first: 20) {
-                                    nodes {
-                                        ... on ProjectV2ItemFieldDateValue {
-                                            date
-                                            field {
-                                                ... on ProjectV2FieldCommon {
-                                                    name
-                                                }
-                                            }
-                                        }
-                                        ... on ProjectV2ItemFieldTextValue {
-                                            text
-                                            field {
-                                                ... on ProjectV2FieldCommon {
-                                                    name
-                                                }
-                                            }
-                                        }
-                                        ... on ProjectV2ItemFieldSingleSelectValue {
-                                            name
-                                            field {
-                                                ... on ProjectV2FieldCommon {
-                                                    name
-                                                }
-                                            }
-                                        }
+    const number = parseInt(PROJECT_NUMBER, 10);
+    if (!GITHUB_OWNER || Number.isNaN(number)) {
+        console.error(
+            'Missing config: set GITHUB_OWNER (or GITHUB_ORG) to your GitHub login/slug, and PROJECT_NUMBER to a number.'
+        );
+        console.error('Examples: GITHUB_OWNER=ComfortDevInnov (from https://github.com/ComfortDevInnov), PROJECT_NUMBER=1');
+        return [];
+    }
+
+    const queryBody = `
+        projectV2(number: $number) {
+            id
+            items(first: 100) {
+                nodes {
+                    id
+                    fieldValues(first: 20) {
+                        nodes {
+                            ... on ProjectV2ItemFieldDateValue {
+                                date
+                                field {
+                                    ... on ProjectV2FieldCommon {
+                                        name
                                     }
                                 }
-                                content {
-                                    ... on Issue {
-                                        number
-                                        title
-                                        url
-                                        assignees(first: 10) {
-                                            nodes {
-                                                login
-                                            }
-                                        }
-                                        repository {
-                                            name
-                                        }
+                            }
+                            ... on ProjectV2ItemFieldTextValue {
+                                text
+                                field {
+                                    ... on ProjectV2FieldCommon {
+                                        name
                                     }
-                                    ... on PullRequest {
-                                        number
-                                        title
-                                        url
-                                        assignees(first: 10) {
-                                            nodes {
-                                                login
-                                            }
-                                        }
-                                        repository {
-                                            name
-                                        }
+                                }
+                            }
+                            ... on ProjectV2ItemFieldSingleSelectValue {
+                                name
+                                field {
+                                    ... on ProjectV2FieldCommon {
+                                        name
                                     }
                                 }
                             }
                         }
                     }
+                    content {
+                        ... on Issue {
+                            number
+                            title
+                            url
+                            assignees(first: 10) {
+                                nodes {
+                                    login
+                                }
+                            }
+                            repository {
+                                name
+                            }
+                        }
+                        ... on PullRequest {
+                            number
+                            title
+                            url
+                            assignees(first: 10) {
+                                nodes {
+                                    login
+                                }
+                            }
+                            repository {
+                                name
+                            }
+                        }
+                    }
                 }
             }
-        `, {
-            org: GITHUB_ORG,
-            number: parseInt(PROJECT_NUMBER)
-        });
+        }
+    `;
 
-        return project.organization.projectV2.items.nodes;
+    // Try organization-owned project first
+    try {
+        const project = await octokit.graphql(
+            `
+            query($login: String!, $number: Int!) {
+                organization(login: $login) {
+                    ${queryBody}
+                }
+            }
+            `,
+            { login: GITHUB_OWNER, number }
+        );
+
+        return project?.organization?.projectV2?.items?.nodes || [];
     } catch (error) {
-        console.error('Error fetching project items:', error);
+        const message = error?.message || '';
+        if (message.includes('Could not resolve to an Organization')) {
+            console.error(
+                `GitHub org not found for login "${GITHUB_OWNER}". If you used a display name (with spaces), replace it with the URL slug (e.g. https://github.com/<slug>).`
+            );
+        } else {
+            console.error('Error fetching org project items:', error);
+        }
+    }
+
+    // Fallback: user-owned project
+    try {
+        const project = await octokit.graphql(
+            `
+            query($login: String!, $number: Int!) {
+                user(login: $login) {
+                    ${queryBody}
+                }
+            }
+            `,
+            { login: GITHUB_OWNER, number }
+        );
+
+        return project?.user?.projectV2?.items?.nodes || [];
+    } catch (error) {
+        console.error('Error fetching user project items:', error);
         return [];
     }
 }
@@ -344,7 +384,8 @@ async function sendNotification(channel, item, when, color) {
 }
 
 // Discord bot ready event
-discord.once('ready', () => {
+// (discord.js v15+ renamed "ready" to "clientReady"; this keeps you compatible across versions)
+discord.once(Events?.ClientReady ?? 'clientReady', () => {
     console.log(`Logged in as ${discord.user.tag}`);
     console.log('Bot is ready and monitoring deadlines!');
     

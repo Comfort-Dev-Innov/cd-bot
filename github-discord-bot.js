@@ -610,6 +610,13 @@ cron.schedule('*/15 * * * *', () => {
     checkNewAssignments();
 });
 
+// Daily idle dev report (who has no assigned ticket in Todo/In Progress)
+if (ENABLE_IDLE_REPORT) {
+    cron.schedule(IDLE_REPORT_CRON, () => {
+        sendIdleDevelopersReport();
+    });
+}
+
 // You can also add a manual trigger command
 discord.on('messageCreate', async (message) => {
     if (message.content === '!check-deadlines' && message.member.permissions.has('Administrator')) {
@@ -620,6 +627,11 @@ discord.on('messageCreate', async (message) => {
     if (message.content === '!check-assignments' && message.member.permissions.has('Administrator')) {
         await message.reply('Checking for new assignments...');
         await checkNewAssignments();
+    }
+
+    if (message.content === '!check-idle' && message.member.permissions.has('Administrator')) {
+        await message.reply('Checking for idle devs...');
+        await sendIdleDevelopersReport();
     }
 });
 

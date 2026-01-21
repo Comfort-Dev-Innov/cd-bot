@@ -633,6 +633,16 @@ discord.on('messageCreate', async (message) => {
         await message.reply('Checking for idle devs...');
         await sendIdleDevelopersReport();
     }
+
+    // Quick broadcast command: posts into the channel you typed it in
+    // Usage:
+    // - !revisions-requested
+    // - !revisions-requested <optional extra context>
+    if (message.content.startsWith('!revisions-requested') && message.member.permissions.has('Administrator')) {
+        const extra = message.content.replace('!revisions-requested', '').trim();
+        const text = extra ? `🔄 Revisions are requested! ${extra}` : '🔄 Revisions are requested!';
+        await message.channel.send(text);
+    }
 });
 
 // Login to Discord

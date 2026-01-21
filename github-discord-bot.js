@@ -7,15 +7,41 @@ const path = require('path');
 // Configuration
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
+// Optional "default" channel (used as fallback).
+const DEFAULT_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 // NOTE: This must be the GitHub *login/slug* (the bit in the URL), not the display name.
 // Supports both organization-owned and user-owned Projects V2.
 const GITHUB_OWNER = process.env.GITHUB_OWNER || process.env.GITHUB_ORG;
 const PROJECT_NUMBER = process.env.PROJECT_NUMBER;
 
+// Routing config:
+// - USER_MAPPINGS: GitHub login -> Discord user ID (for @mentions + DM fallback)
+// - DEV_CHANNEL_MAPPINGS: GitHub login -> Discord channel ID (send to each dev's channel)
+const DEV_CHANNEL_MAPPINGS_ENV = process.env.DEV_CHANNEL_MAPPINGS || process.env.USER_CHANNEL_MAPPINGS;
+const devChannelMappings = new Map();
+if (DEV_CHANNEL_MAPPINGS_ENV) {
+    try {
+        const mappings = JSON.parse(DEV_CHANNEL_MAPPINGS_ENV);
+        Object.entries(mappings).forEach(([github, channelId]) => {
+            if (channelId) devChannelMappings.set(github, String(channelId));
+        });
+    } catch (e) {
+        console.error('Invalid DEV_CHANNEL_MAPPINGS JSON:', e);
+    }
+}
+
+// Behavior toggles
+const RUN_ON_STARTUP = String(process.env.RUN_ON_STARTUP || '').toLowerCase() === 'true';
+const SUPPRESS_INITIAL_ASSIGNMENT_NOTIFICATIONS =
+    String(process.env.SUPPRESS_INITIAL_ASSIGNMENT_NOTIFICATIONS || '').toLowerCase() !== 'false'; // default: true
+const PING_ON_ASSIGNMENTS = String(process.env.PING_ON_ASSIGNMENTS || '').toLowerCase() !== 'false'; // default: true
+const PING_ON_DEADLINES = String(process.env.PING_ON_DEADLINES || '').toLowerCase() !== 'false'; // default: true
+const NOTIFY_UNASSIGNED_DEADLINES_TO_DEFAULT_CHANNEL =
+    String(process.env.NOTIFY_UNASSIGNED_DEADLINES_TO_DEFAULT_CHANNEL || '').toLowerCase() === 'true';
+
 // Initialize clients
 const discord = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
 
 const octokit = new Octokit({
@@ -35,6 +61,7 @@ if (process.env.USER_MAPPINGS) {
 // Store previous state of assignments (issue/PR URL -> assignee usernames)
 const STORAGE_FILE = path.join(__dirname, 'assignment-state.json');
 let previousAssignments = new Map();
+let hasLoadedAssignmentState = false;
 
 // Load previous assignments from file
 function loadPreviousAssignments() {
@@ -42,6 +69,7 @@ function loadPreviousAssignments() {
         if (fs.existsSync(STORAGE_FILE)) {
             const data = JSON.parse(fs.readFileSync(STORAGE_FILE, 'utf8'));
             previousAssignments = new Map(Object.entries(data));
+            hasLoadedAssignmentState = true;
             console.log('Loaded previous assignment state');
         }
     } catch (error) {
@@ -213,6 +241,61 @@ function isDeadlineTomorrow(deadline) {
     return deadlineDate.getTime() === tomorrow.getTime();
 }
 
+function getDiscordUserIdForGithubLogin(githubLogin) {
+    return userMappings.get(githubLogin);
+}
+
+function getMentionsForGithubLogins(githubLogins) {
+    return githubLogins
+        .map(login => getDiscordUserIdForGithubLogin(login))
+        .filter(Boolean)
+        .map(id => `<@${id}>`)
+        .join(' ');
+}
+
+function getTargetsForGithubLogins(githubLogins) {
+    // Returns array of targets: { type: 'channel', id } or { type: 'dm', userId }
+    const targets = [];
+    const seen = new Set();
+
+    for (const login of githubLogins) {
+        const channelId = devChannelMappings.get(login);
+        if (channelId) {
+            const key = `channel:${channelId}`;
+            if (!seen.has(key)) {
+                targets.push({ type: 'channel', id: channelId, githubLogin: login });
+                seen.add(key);
+            }
+            continue;
+        }
+
+        const userId = getDiscordUserIdForGithubLogin(login);
+        if (userId) {
+            const key = `dm:${userId}`;
+            if (!seen.has(key)) {
+                targets.push({ type: 'dm', userId, githubLogin: login });
+                seen.add(key);
+            }
+        }
+    }
+
+    return targets;
+}
+
+async function sendToTarget(target, payload) {
+    if (target.type === 'channel') {
+        const channel = await discord.channels.fetch(target.id);
+        await channel.send(payload);
+        return;
+    }
+    if (target.type === 'dm') {
+        const user = await discord.users.fetch(target.userId);
+        await user.send(payload);
+        return;
+    }
+    throw new Error(`Unknown target type: ${target.type}`);
+}
+
 async function checkDeadlinesAndNotify() {
     console.log('Checking for upcoming deadlines...');
     
@@ -233,16 +316,14 @@ async function checkDeadlinesAndNotify() {
         }
     });
 
-    const channel = await discord.channels.fetch(CHANNEL_ID);
-
     // Send notifications for today's deadlines
     for (const item of todayItems) {
-        await sendNotification(channel, item, 'TODAY', '#ff0000');
+        await sendDeadlineNotification(item, 'TODAY', '#ff0000');
     }
 
     // Send notifications for tomorrow's deadlines
     for (const item of tomorrowItems) {
-        await sendNotification(channel, item, 'TOMORROW', '#ffa500');
+        await sendDeadlineNotification(item, 'TOMORROW', '#ffa500');
     }
 
     console.log(`Found ${todayItems.length} items due today and ${tomorrowItems.length} items due tomorrow`);
@@ -283,37 +364,41 @@ async function checkNewAssignments() {
         }
     });
 
-    // Send notifications for new assignments
-    if (newAssignments.length > 0) {
-        const channel = await discord.channels.fetch(CHANNEL_ID);
-        
-        for (const { item, newAssignees } of newAssignments) {
-            await sendNewAssignmentNotification(channel, item, newAssignees);
-        }
+    // Baseline behavior:
+    // If we have no stored state, don't notify for existing assignments; just record current state and start "going forward".
+    if (!hasLoadedAssignmentState && SUPPRESS_INITIAL_ASSIGNMENT_NOTIFICATIONS) {
+        previousAssignments = currentAssignments;
+        savePreviousAssignments();
+        hasLoadedAssignmentState = true;
+        console.log('No previous assignment state found. Baseline created; skipping initial assignment notifications.');
+        return;
+    }
+
+    // Send notifications for new assignments (going forward)
+    for (const { item, newAssignees } of newAssignments) {
+        await sendNewAssignmentNotifications(item, newAssignees);
     }
 
     // Update stored state
     previousAssignments = currentAssignments;
     savePreviousAssignments();
+    hasLoadedAssignmentState = true;
 
     console.log(`Found ${newAssignments.length} new assignments`);
 }
 
-async function sendNewAssignmentNotification(channel, item, newAssignees) {
+async function sendNewAssignmentNotifications(item, newAssignees) {
     const content = item.content;
     const deadline = getDeadlineFromItem(item);
 
-    // Build mention string
-    let mentions = '';
-    const discordMentions = newAssignees
-        .map(username => userMappings.get(username))
-        .filter(id => id)
-        .map(id => `<@${id}>`)
-        .join(' ');
-    
-    if (discordMentions) {
-        mentions = discordMentions + ' ';
+    const targets = getTargetsForGithubLogins(newAssignees);
+    const fallbackTargets = [];
+    if (targets.length === 0 && DEFAULT_CHANNEL_ID) {
+        fallbackTargets.push({ type: 'channel', id: DEFAULT_CHANNEL_ID });
     }
+
+    const mentionText = PING_ON_ASSIGNMENTS ? getMentionsForGithubLogins(newAssignees) : '';
+    const contentText = `${mentionText ? `${mentionText} ` : ''}You've been assigned to a new ticket!`;
 
     const embed = new EmbedBuilder()
         .setColor('#00ff00')
@@ -334,30 +419,32 @@ async function sendNewAssignmentNotification(channel, item, newAssignees) {
         value: newAssignees.map(a => `@${a}`).join(', ')
     });
 
-    await channel.send({
-        content: `${mentions}You've been assigned to a new ticket!`,
-        embeds: [embed]
-    });
+    const payload = { content: contentText, embeds: [embed] };
+    const sendTargets = targets.length > 0 ? targets : fallbackTargets;
+
+    for (const target of sendTargets) {
+        await sendToTarget(target, payload);
+    }
 }
 
-async function sendNotification(channel, item, when, color) {
+async function sendDeadlineNotification(item, when, color) {
     const content = item.content;
     const assignees = content.assignees.nodes;
     const deadline = getDeadlineFromItem(item);
 
-    // Build mention string
-    let mentions = '';
-    if (assignees.length > 0) {
-        const discordMentions = assignees
-            .map(a => userMappings.get(a.login))
-            .filter(id => id)
-            .map(id => `<@${id}>`)
-            .join(' ');
-        
-        if (discordMentions) {
-            mentions = discordMentions + ' ';
-        }
+    const assigneeLogins = assignees.map(a => a.login);
+    const targets = getTargetsForGithubLogins(assigneeLogins);
+
+    const fallbackTargets = [];
+    if (
+        targets.length === 0 &&
+        DEFAULT_CHANNEL_ID &&
+        (NOTIFY_UNASSIGNED_DEADLINES_TO_DEFAULT_CHANNEL || assignees.length === 0)
+    ) {
+        fallbackTargets.push({ type: 'channel', id: DEFAULT_CHANNEL_ID });
     }
+
+    const mentionText = PING_ON_DEADLINES ? getMentionsForGithubLogins(assigneeLogins) : '';
 
     const embed = new EmbedBuilder()
         .setColor(color)
@@ -377,10 +464,12 @@ async function sendNotification(channel, item, when, color) {
         });
     }
 
-    await channel.send({
-        content: mentions || undefined,
-        embeds: [embed]
-    });
+    const payload = { content: mentionText || undefined, embeds: [embed] };
+    const sendTargets = targets.length > 0 ? targets : fallbackTargets;
+
+    for (const target of sendTargets) {
+        await sendToTarget(target, payload);
+    }
 }
 
 // Discord bot ready event
@@ -392,9 +481,14 @@ discord.once(Events?.ClientReady ?? 'clientReady', () => {
     // Load previous assignment state
     loadPreviousAssignments();
     
-    // Run initial check
-    checkDeadlinesAndNotify();
-    checkNewAssignments();
+    // Avoid "redeploy spam" by default: rely on scheduled cron checks.
+    // Opt-in if you want a run immediately at startup.
+    if (RUN_ON_STARTUP) {
+        checkDeadlinesAndNotify();
+        checkNewAssignments();
+    } else {
+        console.log('Startup checks skipped (RUN_ON_STARTUP=false). Waiting for scheduled checks.');
+    }
 });
 
 // Schedule deadline checks - runs every day at 9 AM

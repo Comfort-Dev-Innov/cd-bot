@@ -39,6 +39,18 @@ const PING_ON_DEADLINES = String(process.env.PING_ON_DEADLINES || '').toLowerCas
 const NOTIFY_UNASSIGNED_DEADLINES_TO_DEFAULT_CHANNEL =
     String(process.env.NOTIFY_UNASSIGNED_DEADLINES_TO_DEFAULT_CHANNEL || '').toLowerCase() === 'true';
 
+// Daily "idle devs" report: who has no assigned ticket in specific statuses (e.g. Todo/In Progress)
+const ENABLE_IDLE_REPORT = String(process.env.ENABLE_IDLE_REPORT || '').toLowerCase() !== 'false'; // default: true
+const IDLE_REPORT_DISCORD_USER_ID =
+    process.env.IDLE_REPORT_DISCORD_USER_ID || process.env.REPORT_DISCORD_USER_ID || process.env.ADMIN_DISCORD_USER_ID;
+const IDLE_REPORT_CHANNEL_ID = process.env.IDLE_REPORT_CHANNEL_ID || process.env.REPORT_CHANNEL_ID;
+const IDLE_REPORT_CRON = process.env.IDLE_REPORT_CRON || '5 9 * * *'; // default: daily 9:05
+const IDLE_STATUS_NAMES = (process.env.IDLE_STATUS_NAMES || 'Todo,In Progress')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+const IDLE_STATUS_FIELD_NAME = (process.env.IDLE_STATUS_FIELD_NAME || '').trim(); // optional: exact field name (e.g. "Status")
+
 // Initialize clients
 const discord = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
@@ -224,6 +236,34 @@ function getDeadlineFromItem(item) {
     return null;
 }
 
+function normalizeStatusName(name) {
+    return String(name || '').trim().toLowerCase();
+}
+
+function getStatusFromItem(item) {
+    // Returns { fieldName, valueName } or null
+    const singleSelectFields = (item?.fieldValues?.nodes || []).filter(
+        node => node?.field?.name && typeof node?.name === 'string'
+    );
+
+    const desiredFieldName = IDLE_STATUS_FIELD_NAME ? normalizeStatusName(IDLE_STATUS_FIELD_NAME) : '';
+
+    // Prefer explicit configured field name
+    if (desiredFieldName) {
+        const match = singleSelectFields.find(n => normalizeStatusName(n.field.name) === desiredFieldName);
+        if (match) return { fieldName: match.field.name, valueName: match.name };
+    }
+
+    // Otherwise, best-effort: find a field that looks like a Status/Column
+    const fallback = singleSelectFields.find(n => {
+        const field = normalizeStatusName(n.field.name);
+        return field.includes('status') || field.includes('column');
+    });
+    if (fallback) return { fieldName: fallback.field.name, valueName: fallback.name };
+
+    return null;
+}
+
 function isDeadlineToday(deadline) {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -294,6 +334,75 @@ async function sendToTarget(target, payload) {
         return;
     }
     throw new Error(`Unknown target type: ${target.type}`);
+}
+
+function getAllKnownDevelopers() {
+    const all = new Set();
+    for (const k of devChannelMappings.keys()) all.add(k);
+    for (const k of userMappings.keys()) all.add(k);
+    return Array.from(all).sort((a, b) => a.localeCompare(b));
+}
+
+async function sendIdleDevelopersReport() {
+    if (!ENABLE_IDLE_REPORT) return;
+
+    const items = await getProjectItems();
+    const targetStatuses = new Set(IDLE_STATUS_NAMES.map(normalizeStatusName));
+    const activeAssignees = new Set();
+
+    for (const item of items) {
+        if (!item?.content) continue;
+
+        const status = getStatusFromItem(item);
+        if (!status) continue;
+
+        if (!targetStatuses.has(normalizeStatusName(status.valueName))) continue;
+
+        const assignees = item.content.assignees?.nodes || [];
+        for (const a of assignees) {
+            if (a?.login) activeAssignees.add(a.login);
+        }
+    }
+
+    const developers = getAllKnownDevelopers();
+    const idle = developers.filter(login => !activeAssignees.has(login));
+
+    const embed = new EmbedBuilder()
+        .setColor('#5865F2')
+        .setTitle('📋 Daily idle devs report')
+        .addFields(
+            { name: 'Statuses checked', value: IDLE_STATUS_NAMES.join(', '), inline: false },
+            { name: 'Known devs', value: String(developers.length), inline: true },
+            { name: 'Active (has ticket)', value: String(activeAssignees.size), inline: true },
+            { name: 'Idle (no ticket)', value: String(idle.length), inline: true }
+        )
+        .setTimestamp();
+
+    if (idle.length > 0) {
+        embed.addFields({
+            name: 'Idle devs (GitHub logins)',
+            value: idle.map(u => `- ${u}`).join('\n').slice(0, 1024) // Discord field limit safety
+        });
+    } else {
+        embed.addFields({ name: 'Idle devs (GitHub logins)', value: 'None 🎉' });
+    }
+
+    const payload = { embeds: [embed] };
+
+    if (IDLE_REPORT_CHANNEL_ID) {
+        await sendToTarget({ type: 'channel', id: String(IDLE_REPORT_CHANNEL_ID) }, payload);
+        return;
+    }
+    if (IDLE_REPORT_DISCORD_USER_ID) {
+        await sendToTarget({ type: 'dm', userId: String(IDLE_REPORT_DISCORD_USER_ID) }, payload);
+        return;
+    }
+    if (DEFAULT_CHANNEL_ID) {
+        await sendToTarget({ type: 'channel', id: String(DEFAULT_CHANNEL_ID) }, payload);
+        return;
+    }
+
+    console.log('Idle report enabled, but no report recipient configured (set IDLE_REPORT_* or DISCORD_CHANNEL_ID).');
 }
 
 async function checkDeadlinesAndNotify() {

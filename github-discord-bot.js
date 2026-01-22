@@ -39,6 +39,11 @@ const PING_ON_DEADLINES = String(process.env.PING_ON_DEADLINES || '').toLowerCas
 const NOTIFY_UNASSIGNED_DEADLINES_TO_DEFAULT_CHANNEL =
     String(process.env.NOTIFY_UNASSIGNED_DEADLINES_TO_DEFAULT_CHANNEL || '').toLowerCase() === 'true';
 
+const DEADLINE_EXCLUDE_STATUS_NAMES = (process.env.DEADLINE_EXCLUDE_STATUS_NAMES || 'Done')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
 // Daily "idle devs" report: who has no assigned ticket in specific statuses (e.g. Todo/In Progress)
 const ENABLE_IDLE_REPORT = String(process.env.ENABLE_IDLE_REPORT || '').toLowerCase() !== 'false'; // default: true
 const IDLE_REPORT_DISCORD_USER_ID =
@@ -420,9 +425,16 @@ async function checkDeadlinesAndNotify() {
     const items = await getProjectItems();
     const todayItems = [];
     const tomorrowItems = [];
+    const excludedStatuses = new Set(DEADLINE_EXCLUDE_STATUS_NAMES.map(normalizeStatusName));
 
     items.forEach(item => {
         if (!item.content) return;
+
+        // Skip "Done" (or other excluded) statuses/columns
+        if (excludedStatuses.size > 0) {
+            const status = getStatusFromItem(item);
+            if (status && excludedStatuses.has(normalizeStatusName(status.valueName))) return;
+        }
 
         const deadline = getDeadlineFromItem(item);
         if (!deadline) return;

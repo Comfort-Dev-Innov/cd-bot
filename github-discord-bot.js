@@ -222,17 +222,26 @@ async function getProjectItems() {
 }
 
 function getDeadlineFromItem(item) {
-    const dateFields = item.fieldValues.nodes.filter(
-        node => node.field && (
-            node.field.name.toLowerCase().includes('deadline') ||
-            node.field.name.toLowerCase().includes('due date') ||
-            node.field.name.toLowerCase() === 'date'
-        )
-    );
-    
-    if (dateFields.length > 0 && dateFields[0].date) {
-        return new Date(dateFields[0].date);
+    const nodes = item?.fieldValues?.nodes || [];
+
+    // GitHub Projects V2: the ticket "due date" is usually represented by a date field value.
+    // We match common field names. (Your project uses "End date".)
+    for (const node of nodes) {
+        const fieldName = String(node?.field?.name || '').trim().toLowerCase();
+        if (!fieldName) continue;
+
+        const isDeadlineField =
+            fieldName.includes('deadline') ||
+            fieldName.includes('due date') ||
+            fieldName.includes('end date') ||
+            fieldName === 'date';
+
+        if (!isDeadlineField) continue;
+        if (!node?.date) continue;
+
+        return new Date(node.date);
     }
+
     return null;
 }
 

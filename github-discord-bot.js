@@ -98,9 +98,8 @@ const STORAGE_FILE = path.join(__dirname, 'assignment-state.json');
 let previousAssignments = new Map();
 let hasLoadedAssignmentState = false;
 
-// Store previous "RR" state (issue/PR URL -> true if currently RR)
 const RR_STORAGE_FILE = path.join(__dirname, 'rr-state.json');
-let previousRRUrls = new Set();
+let previousRRByUrl = new Map();
 let hasLoadedRRState = false;
 
 // Load previous assignments from file
@@ -121,14 +120,20 @@ function loadRRState() {
     try {
         if (!fs.existsSync(RR_STORAGE_FILE)) return;
         const raw = JSON.parse(fs.readFileSync(RR_STORAGE_FILE, 'utf8'));
+        // Supported shapes:
+        // - { "<issueUrl>": <commentIdNumber>, ... }  (current)
+        // - [ "<issueUrl>", ... ]                    (legacy; treated as "already notified")
+        const next = new Map();
         if (Array.isArray(raw)) {
-            previousRRUrls = new Set(raw.map(String));
+            // Legacy format: treat as "already notified" for that URL.
+            for (const url of raw) next.set(String(url), -1);
         } else if (raw && typeof raw === 'object') {
-            // Back-compat / flexibility if the file is ever stored as an object
-            previousRRUrls = new Set(Object.keys(raw).map(String));
-        } else {
-            previousRRUrls = new Set();
+            for (const [url, commentId] of Object.entries(raw)) {
+                const id = Number(commentId);
+                next.set(String(url), Number.isFinite(id) ? id : 0);
+            }
         }
+        previousRRByUrl = next;
         hasLoadedRRState = true;
         console.log('Loaded previous RR state');
     } catch (error) {
@@ -148,7 +153,8 @@ function savePreviousAssignments() {
 
 function saveRRState() {
     try {
-        fs.writeFileSync(RR_STORAGE_FILE, JSON.stringify(Array.from(previousRRUrls), null, 2));
+        const obj = Object.fromEntries(previousRRByUrl);
+        fs.writeFileSync(RR_STORAGE_FILE, JSON.stringify(obj, null, 2));
     } catch (error) {
         console.error('Error saving RR state:', error);
     }
@@ -200,6 +206,7 @@ async function getProjectItems() {
                     }
                     content {
                         ... on Issue {
+                            __typename
                             number
                             title
                             url
@@ -210,9 +217,13 @@ async function getProjectItems() {
                             }
                             repository {
                                 name
+                                owner {
+                                    login
+                                }
                             }
                         }
                         ... on PullRequest {
+                            __typename
                             number
                             title
                             url
@@ -223,6 +234,9 @@ async function getProjectItems() {
                             }
                             repository {
                                 name
+                                owner {
+                                    login
+                                }
                             }
                         }
                     }
@@ -336,39 +350,78 @@ function tokenizeAlphaNumLower(s) {
         .filter(Boolean);
 }
 
-function getTextFieldsFromItem(item) {
-    return (item?.fieldValues?.nodes || [])
-        .filter(node => node?.field?.name && typeof node?.text === 'string')
-        .map(node => ({
-            fieldName: String(node.field.name),
-            text: String(node.text || '')
-        }));
+function isAlphaNum(ch) {
+    return typeof ch === 'string' && /^[a-z0-9]$/i.test(ch);
 }
 
-function getRRMatchFromItem(item) {
-    // Normalize codes the same way we normalize field text:
-    // this makes codes like "/RR" match a value like "/RR" (token "rr").
-    const codes = new Set(
-        RR_CODES.flatMap(c => tokenizeAlphaNumLower(String(c || '')))
-            .map(s => s.trim())
-            .filter(Boolean)
-    );
-    if (codes.size === 0) return null;
+function findStandaloneCode(text, rawCode) {
+    const body = String(text || '');
+    const code = String(rawCode || '');
+    if (!body || !code) return null;
 
-    const desiredFieldName = RR_CODE_FIELD_NAME ? normalizeStatusName(RR_CODE_FIELD_NAME) : '';
-    const fields = getTextFieldsFromItem(item);
-    const candidates = desiredFieldName
-        ? fields.filter(f => normalizeStatusName(f.fieldName) === desiredFieldName)
-        : fields;
+    const lowerBody = body.toLowerCase();
+    const lowerCode = code.toLowerCase();
 
-    for (const f of candidates) {
-        const tokens = tokenizeAlphaNumLower(f.text);
-        for (const code of codes) {
-            if (tokens.includes(code)) {
-                return { code, fieldName: f.fieldName, rawValue: f.text };
-            }
+    let idx = 0;
+    while (true) {
+        const at = lowerBody.indexOf(lowerCode, idx);
+        if (at === -1) return null;
+
+        const before = at > 0 ? lowerBody[at - 1] : '';
+        const after = at + lowerCode.length < lowerBody.length ? lowerBody[at + lowerCode.length] : '';
+
+        // "Standalone" means not embedded in a larger alphanumeric token.
+        if (!isAlphaNum(before) && !isAlphaNum(after)) {
+            return { index: at };
+        }
+
+        idx = at + lowerCode.length;
+    }
+}
+
+function findRRCodeInCommentBody(body) {
+    for (const code of RR_CODES.map(s => String(s || '').trim()).filter(Boolean)) {
+        const found = findStandaloneCode(body, code);
+        if (found) return { code };
+    }
+    return null;
+}
+
+async function getLatestMatchingRRComment(item) {
+    const content = item?.content;
+    const owner = content?.repository?.owner?.login;
+    const repo = content?.repository?.name;
+    const issue_number = content?.number;
+    if (!owner || !repo || !issue_number) return null;
+
+    // NOTE: GitHub uses the issues comments API for both Issues and PR conversation comments.
+    const per_page = Math.max(1, Math.min(100, parseInt(process.env.RR_COMMENT_LIMIT || '30', 10) || 30));
+
+    const res = await octokit.rest.issues.listComments({
+        owner,
+        repo,
+        issue_number,
+        per_page,
+        sort: 'created',
+        direction: 'desc'
+    });
+
+    for (const c of res.data || []) {
+        const match = findRRCodeInCommentBody(c?.body || '');
+        if (match) {
+            return {
+                match,
+                comment: {
+                    id: c.id,
+                    html_url: c.html_url,
+                    user: c.user?.login,
+                    created_at: c.created_at,
+                    body: c.body || ''
+                }
+            };
         }
     }
+
     return null;
 }
 
@@ -519,7 +572,6 @@ async function checkRevisionsRequested() {
 
     const items = await getProjectItems();
     const targetStatuses = new Set(RR_STATUS_NAMES.map(normalizeStatusName));
-    const currentRR = new Set();
     const newlyRR = [];
 
     for (const item of items) {
@@ -529,34 +581,39 @@ async function checkRevisionsRequested() {
         if (!status) continue;
         if (targetStatuses.size > 0 && !targetStatuses.has(normalizeStatusName(status.valueName))) continue;
 
-        const match = getRRMatchFromItem(item);
-        if (!match) continue;
-
         const url = String(item.content.url);
-        currentRR.add(url);
-        if (previousRRUrls.has(url)) continue;
-        newlyRR.push({ item, match, status });
+        const found = await getLatestMatchingRRComment(item);
+        if (!found) continue;
+
+        const lastNotifiedCommentId = previousRRByUrl.get(url);
+        if (lastNotifiedCommentId === -1) continue; // legacy "already notified" sentinel
+        const thisCommentId = Number(found.comment.id);
+        if (Number.isFinite(lastNotifiedCommentId) && lastNotifiedCommentId === thisCommentId) continue;
+
+        newlyRR.push({ item, status, ...found });
     }
 
     // Baseline behavior:
     // If we have no stored state, don't notify for existing RR items; just record current state and start "going forward".
     if (!hasLoadedRRState && SUPPRESS_INITIAL_RR_NOTIFICATIONS) {
-        previousRRUrls = currentRR;
+        for (const { item: it, comment } of newlyRR) {
+            previousRRByUrl.set(String(it.content.url), Number(comment.id));
+        }
         saveRRState();
         hasLoadedRRState = true;
         console.log('No previous RR state found. Baseline created; skipping initial RR notifications.');
         return;
     }
 
-    for (const { item, match, status } of newlyRR) {
-        await sendRevisionsRequestedNotification(item, match, status);
+    for (const { item, match, status, comment } of newlyRR) {
+        await sendRevisionsRequestedNotification(item, match, status, comment);
+        previousRRByUrl.set(String(item.content.url), Number(comment.id));
     }
 
-    previousRRUrls = currentRR;
     saveRRState();
     hasLoadedRRState = true;
 
-    console.log(`Found ${currentRR.size} RR items; ${newlyRR.length} newly marked RR`);
+    console.log(`Found ${newlyRR.length} newly matched RR comments`);
 }
 
 async function checkDeadlinesAndNotify() {
@@ -748,7 +805,7 @@ async function sendDeadlineNotification(item, when, color) {
     }
 }
 
-async function sendRevisionsRequestedNotification(item, match, status) {
+async function sendRevisionsRequestedNotification(item, match, status, comment) {
     const content = item.content;
     const assignees = content.assignees?.nodes || [];
     const assigneeLogins = assignees.map(a => a.login).filter(Boolean);
@@ -776,9 +833,24 @@ async function sendRevisionsRequestedNotification(item, match, status) {
 
     embed.addFields({
         name: 'RR code',
-        value: `\`${String(match.code).toUpperCase()}\`${match.fieldName ? ` (field: ${match.fieldName})` : ''}`,
+        value: `\`${String(match.code)}\``,
         inline: false
     });
+
+    if (comment?.user || comment?.html_url) {
+        embed.addFields({
+            name: 'Comment',
+            value: `${comment.user ? `By \`${comment.user}\`` : 'By unknown'}${comment.created_at ? ` on ${new Date(comment.created_at).toDateString()}` : ''}\n${comment.html_url ? comment.html_url : ''}`.trim().slice(0, 1024)
+        });
+    }
+
+    const bodyPreview = String(comment?.body || '').trim();
+    if (bodyPreview) {
+        embed.addFields({
+            name: 'Comment preview',
+            value: bodyPreview.length > 900 ? `${bodyPreview.slice(0, 900)}…` : bodyPreview
+        });
+    }
 
     if (assigneeLogins.length > 0) {
         embed.addFields({ name: 'Assignees', value: assigneeLogins.map(a => `@${a}`).join(', ') });

@@ -39,10 +39,18 @@ const PING_ON_DEADLINES = String(process.env.PING_ON_DEADLINES || '').toLowerCas
 const NOTIFY_UNASSIGNED_DEADLINES_TO_DEFAULT_CHANNEL =
     String(process.env.NOTIFY_UNASSIGNED_DEADLINES_TO_DEFAULT_CHANNEL || '').toLowerCase() === 'true';
 
+function parseCommaList(raw, fallbackCsv) {
+    const base = String((raw == null || String(raw).trim() === '') ? fallbackCsv : raw);
+    return base
+        .split(',')
+        .map(s => String(s).trim())
+        .map(s => s.replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1').trim())
+        .filter(Boolean);
+}
+
 const DEADLINE_EXCLUDE_STATUS_NAMES = (process.env.DEADLINE_EXCLUDE_STATUS_NAMES || 'Done')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
+    ? parseCommaList(process.env.DEADLINE_EXCLUDE_STATUS_NAMES, 'Done')
+    : ['Done'];
 
 // Daily "idle devs" report: who has no assigned ticket in specific statuses (e.g. Todo/In Progress)
 const ENABLE_IDLE_REPORT = String(process.env.ENABLE_IDLE_REPORT || '').toLowerCase() !== 'false'; // default: true
@@ -433,7 +441,13 @@ async function checkDeadlinesAndNotify() {
         // Skip "Done" (or other excluded) statuses/columns
         if (excludedStatuses.size > 0) {
             const status = getStatusFromItem(item);
-            if (status && excludedStatuses.has(normalizeStatusName(status.valueName))) return;
+            if (status) {
+                const value = normalizeStatusName(status.valueName);
+                // exact match OR prefix match (handles e.g. "Done ✅")
+                for (const ex of excludedStatuses) {
+                    if (value === ex || value.startsWith(`${ex} `)) return;
+                }
+            }
         }
 
         const deadline = getDeadlineFromItem(item);

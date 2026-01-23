@@ -577,6 +577,8 @@ async function checkRevisionsRequested() {
     for (const item of items) {
         if (!item?.content) continue;
 
+        if (item.content.__typename && item.content.__typename !== 'Issue') continue;
+
         const status = getStatusFromItem(item);
         if (!status) continue;
         if (targetStatuses.size > 0 && !targetStatuses.has(normalizeStatusName(status.valueName))) continue;

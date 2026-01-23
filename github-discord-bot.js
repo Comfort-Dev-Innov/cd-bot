@@ -64,6 +64,16 @@ const IDLE_STATUS_NAMES = (process.env.IDLE_STATUS_NAMES || 'Todo,In Progress')
     .filter(Boolean);
 const IDLE_STATUS_FIELD_NAME = (process.env.IDLE_STATUS_FIELD_NAME || '').trim(); // optional: exact field name (e.g. "Status")
 
+const ENABLE_RR_MONITORING = String(process.env.ENABLE_RR_MONITORING || '').toLowerCase() !== 'false';
+const RR_STATUS_NAMES = parseCommaList(process.env.RR_STATUS_NAMES, 'In Progress');
+const RR_CODE_FIELD_NAME = String(process.env.RR_CODE_FIELD_NAME || '').trim(); 
+const RR_CODES = parseCommaList(process.env.RR_CODES, '/RR');
+const RR_CHECK_CRON = process.env.RR_CHECK_CRON || '0 9 * * *';
+const RR_CHANNEL_ID = process.env.RR_CHANNEL_ID || process.env.REVISIONS_CHANNEL_ID;
+const PING_ON_REVISIONS = String(process.env.PING_ON_REVISIONS || '').toLowerCase() !== 'false';
+const SUPPRESS_INITIAL_RR_NOTIFICATIONS =
+    String(process.env.SUPPRESS_INITIAL_RR_NOTIFICATIONS || '').toLowerCase() !== 'false';
+
 // Initialize clients
 const discord = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
@@ -88,6 +98,11 @@ const STORAGE_FILE = path.join(__dirname, 'assignment-state.json');
 let previousAssignments = new Map();
 let hasLoadedAssignmentState = false;
 
+// Store previous "RR" state (issue/PR URL -> true if currently RR)
+const RR_STORAGE_FILE = path.join(__dirname, 'rr-state.json');
+let previousRRUrls = new Set();
+let hasLoadedRRState = false;
+
 // Load previous assignments from file
 function loadPreviousAssignments() {
     try {
@@ -102,6 +117,25 @@ function loadPreviousAssignments() {
     }
 }
 
+function loadRRState() {
+    try {
+        if (!fs.existsSync(RR_STORAGE_FILE)) return;
+        const raw = JSON.parse(fs.readFileSync(RR_STORAGE_FILE, 'utf8'));
+        if (Array.isArray(raw)) {
+            previousRRUrls = new Set(raw.map(String));
+        } else if (raw && typeof raw === 'object') {
+            // Back-compat / flexibility if the file is ever stored as an object
+            previousRRUrls = new Set(Object.keys(raw).map(String));
+        } else {
+            previousRRUrls = new Set();
+        }
+        hasLoadedRRState = true;
+        console.log('Loaded previous RR state');
+    } catch (error) {
+        console.error('Error loading RR state:', error);
+    }
+}
+
 // Save current assignments to file
 function savePreviousAssignments() {
     try {
@@ -109,6 +143,14 @@ function savePreviousAssignments() {
         fs.writeFileSync(STORAGE_FILE, JSON.stringify(data, null, 2));
     } catch (error) {
         console.error('Error saving assignments:', error);
+    }
+}
+
+function saveRRState() {
+    try {
+        fs.writeFileSync(RR_STORAGE_FILE, JSON.stringify(Array.from(previousRRUrls), null, 2));
+    } catch (error) {
+        console.error('Error saving RR state:', error);
     }
 }
 
@@ -286,6 +328,50 @@ function getStatusFromItem(item) {
     return null;
 }
 
+function tokenizeAlphaNumLower(s) {
+    return String(s || '')
+        .trim()
+        .toLowerCase()
+        .split(/[^a-z0-9]+/g)
+        .filter(Boolean);
+}
+
+function getTextFieldsFromItem(item) {
+    return (item?.fieldValues?.nodes || [])
+        .filter(node => node?.field?.name && typeof node?.text === 'string')
+        .map(node => ({
+            fieldName: String(node.field.name),
+            text: String(node.text || '')
+        }));
+}
+
+function getRRMatchFromItem(item) {
+    // Normalize codes the same way we normalize field text:
+    // this makes codes like "/RR" match a value like "/RR" (token "rr").
+    const codes = new Set(
+        RR_CODES.flatMap(c => tokenizeAlphaNumLower(String(c || '')))
+            .map(s => s.trim())
+            .filter(Boolean)
+    );
+    if (codes.size === 0) return null;
+
+    const desiredFieldName = RR_CODE_FIELD_NAME ? normalizeStatusName(RR_CODE_FIELD_NAME) : '';
+    const fields = getTextFieldsFromItem(item);
+    const candidates = desiredFieldName
+        ? fields.filter(f => normalizeStatusName(f.fieldName) === desiredFieldName)
+        : fields;
+
+    for (const f of candidates) {
+        const tokens = tokenizeAlphaNumLower(f.text);
+        for (const code of codes) {
+            if (tokens.includes(code)) {
+                return { code, fieldName: f.fieldName, rawValue: f.text };
+            }
+        }
+    }
+    return null;
+}
+
 function isDeadlineToday(deadline) {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -425,6 +511,52 @@ async function sendIdleDevelopersReport() {
     }
 
     console.log('Idle report enabled, but no report recipient configured (set IDLE_REPORT_* or DISCORD_CHANNEL_ID).');
+}
+
+async function checkRevisionsRequested() {
+    if (!ENABLE_RR_MONITORING) return;
+    console.log('Checking for revisions requested (RR)...');
+
+    const items = await getProjectItems();
+    const targetStatuses = new Set(RR_STATUS_NAMES.map(normalizeStatusName));
+    const currentRR = new Set();
+    const newlyRR = [];
+
+    for (const item of items) {
+        if (!item?.content) continue;
+
+        const status = getStatusFromItem(item);
+        if (!status) continue;
+        if (targetStatuses.size > 0 && !targetStatuses.has(normalizeStatusName(status.valueName))) continue;
+
+        const match = getRRMatchFromItem(item);
+        if (!match) continue;
+
+        const url = String(item.content.url);
+        currentRR.add(url);
+        if (previousRRUrls.has(url)) continue;
+        newlyRR.push({ item, match, status });
+    }
+
+    // Baseline behavior:
+    // If we have no stored state, don't notify for existing RR items; just record current state and start "going forward".
+    if (!hasLoadedRRState && SUPPRESS_INITIAL_RR_NOTIFICATIONS) {
+        previousRRUrls = currentRR;
+        saveRRState();
+        hasLoadedRRState = true;
+        console.log('No previous RR state found. Baseline created; skipping initial RR notifications.');
+        return;
+    }
+
+    for (const { item, match, status } of newlyRR) {
+        await sendRevisionsRequestedNotification(item, match, status);
+    }
+
+    previousRRUrls = currentRR;
+    saveRRState();
+    hasLoadedRRState = true;
+
+    console.log(`Found ${currentRR.size} RR items; ${newlyRR.length} newly marked RR`);
 }
 
 async function checkDeadlinesAndNotify() {
@@ -616,6 +748,50 @@ async function sendDeadlineNotification(item, when, color) {
     }
 }
 
+async function sendRevisionsRequestedNotification(item, match, status) {
+    const content = item.content;
+    const assignees = content.assignees?.nodes || [];
+    const assigneeLogins = assignees.map(a => a.login).filter(Boolean);
+    const targets = getTargetsForGithubLogins(assigneeLogins);
+
+    const fallbackTargets = [];
+    if (targets.length === 0) {
+        if (RR_CHANNEL_ID) fallbackTargets.push({ type: 'channel', id: String(RR_CHANNEL_ID) });
+        else if (DEFAULT_CHANNEL_ID) fallbackTargets.push({ type: 'channel', id: String(DEFAULT_CHANNEL_ID) });
+    }
+
+    const mentionText = PING_ON_REVISIONS ? getMentionsForGithubLogins(assigneeLogins) : '';
+    const contentText = mentionText ? `${mentionText} 🔄 Revisions requested` : '🔄 Revisions requested';
+
+    const embed = new EmbedBuilder()
+        .setColor('#b57edc')
+        .setTitle(`🔄 Revisions Requested: ${content.title}`)
+        .setURL(content.url)
+        .addFields(
+            { name: 'Repository', value: content.repository.name, inline: true },
+            { name: 'Issue/PR', value: `#${content.number}`, inline: true },
+            { name: 'Status', value: status?.valueName ? String(status.valueName) : 'Unknown', inline: true }
+        )
+        .setTimestamp();
+
+    embed.addFields({
+        name: 'RR code',
+        value: `\`${String(match.code).toUpperCase()}\`${match.fieldName ? ` (field: ${match.fieldName})` : ''}`,
+        inline: false
+    });
+
+    if (assigneeLogins.length > 0) {
+        embed.addFields({ name: 'Assignees', value: assigneeLogins.map(a => `@${a}`).join(', ') });
+    }
+
+    const payload = { content: contentText || undefined, embeds: [embed] };
+    const sendTargets = targets.length > 0 ? targets : fallbackTargets;
+
+    for (const target of sendTargets) {
+        await sendToTarget(target, payload);
+    }
+}
+
 // Discord bot ready event
 // (discord.js v15+ renamed "ready" to "clientReady"; this keeps you compatible across versions)
 discord.once(Events?.ClientReady ?? 'clientReady', () => {
@@ -624,12 +800,15 @@ discord.once(Events?.ClientReady ?? 'clientReady', () => {
     
     // Load previous assignment state
     loadPreviousAssignments();
+    // Load previous RR state
+    loadRRState();
     
     // Avoid "redeploy spam" by default: rely on scheduled cron checks.
     // Opt-in if you want a run immediately at startup.
     if (RUN_ON_STARTUP) {
         checkDeadlinesAndNotify();
         checkNewAssignments();
+        checkRevisionsRequested();
     } else {
         console.log('Startup checks skipped (RUN_ON_STARTUP=false). Waiting for scheduled checks.');
     }
@@ -644,6 +823,13 @@ cron.schedule('0 9 * * *', () => {
 cron.schedule('*/15 * * * *', () => {
     checkNewAssignments();
 });
+
+// Check for revisions requested (RR) periodically
+if (ENABLE_RR_MONITORING) {
+    cron.schedule(RR_CHECK_CRON, () => {
+        checkRevisionsRequested();
+    });
+}
 
 // Daily idle dev report (who has no assigned ticket in Todo/In Progress)
 if (ENABLE_IDLE_REPORT) {
@@ -667,6 +853,11 @@ discord.on('messageCreate', async (message) => {
     if (message.content === '!check-idle' && message.member.permissions.has('Administrator')) {
         await message.reply('Checking for idle devs...');
         await sendIdleDevelopersReport();
+    }
+
+    if (message.content === '!check-rr' && message.member.permissions.has('Administrator')) {
+        await message.reply('Checking for revisions requested (RR)...');
+        await checkRevisionsRequested();
     }
 
     // Quick broadcast command: posts into the channel you typed it in

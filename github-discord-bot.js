@@ -176,7 +176,7 @@ async function getProjectItems() {
             items(first: 100) {
                 nodes {
                     id
-                    fieldValues(first: 20) {
+                    fieldValues(first: 50) {
                         nodes {
                             ... on ProjectV2ItemFieldDateValue {
                                 date
@@ -397,14 +397,22 @@ async function getLatestMatchingRRComment(item) {
     // NOTE: GitHub uses the issues comments API for both Issues and PR conversation comments.
     const per_page = Math.max(1, Math.min(100, parseInt(process.env.RR_COMMENT_LIMIT || '30', 10) || 30));
 
-    const res = await octokit.rest.issues.listComments({
-        owner,
-        repo,
-        issue_number,
-        per_page,
-        sort: 'created',
-        direction: 'desc'
-    });
+    let res;
+    try {
+        res = await octokit.rest.issues.listComments({
+            owner,
+            repo,
+            issue_number,
+            per_page,
+            sort: 'created',
+            direction: 'desc'
+        });
+    } catch (e) {
+        if (String(process.env.RR_DEBUG || '').toLowerCase() === 'true') {
+            console.error('RR: failed to list comments', { owner, repo, issue_number, error: e?.message || e });
+        }
+        return null;
+    }
 
     for (const c of res.data || []) {
         const match = findRRCodeInCommentBody(c?.body || '');
@@ -573,17 +581,34 @@ async function checkRevisionsRequested() {
     const items = await getProjectItems();
     const targetStatuses = new Set(RR_STATUS_NAMES.map(normalizeStatusName));
     const newlyRR = [];
+    const rrDebug = String(process.env.RR_DEBUG || '').toLowerCase() === 'true';
+    let total = 0;
+    let skippedNonIssue = 0;
+    let skippedNoStatus = 0;
+    let skippedWrongStatus = 0;
+    let scanned = 0;
 
     for (const item of items) {
         if (!item?.content) continue;
+        total++;
 
-        if (item.content.__typename && item.content.__typename !== 'Issue') continue;
+        if (item.content.__typename && item.content.__typename !== 'Issue') {
+            skippedNonIssue++;
+            continue;
+        }
 
         const status = getStatusFromItem(item);
-        if (!status) continue;
-        if (targetStatuses.size > 0 && !targetStatuses.has(normalizeStatusName(status.valueName))) continue;
+        if (!status) {
+            skippedNoStatus++;
+            continue;
+        }
+        if (targetStatuses.size > 0 && !targetStatuses.has(normalizeStatusName(status.valueName))) {
+            skippedWrongStatus++;
+            continue;
+        }
 
         const url = String(item.content.url);
+        scanned++;
         const found = await getLatestMatchingRRComment(item);
         if (!found) continue;
 
@@ -616,6 +641,18 @@ async function checkRevisionsRequested() {
     hasLoadedRRState = true;
 
     console.log(`Found ${newlyRR.length} newly matched RR comments`);
+    if (rrDebug) {
+        console.log('RR debug:', {
+            fetchedItems: items.length,
+            consideredWithContent: total,
+            scanned,
+            skippedNonIssue,
+            skippedNoStatus,
+            skippedWrongStatus,
+            rrCodes: RR_CODES,
+            rrStatuses: RR_STATUS_NAMES
+        });
+    }
 }
 
 async function checkDeadlinesAndNotify() {

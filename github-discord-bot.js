@@ -68,6 +68,7 @@ const ENABLE_RR_MONITORING = String(process.env.ENABLE_RR_MONITORING || '').toLo
 const RR_STATUS_NAMES = parseCommaList(process.env.RR_STATUS_NAMES, 'In Progress');
 const RR_FIELD_NAME = String(process.env.RR_FIELD_NAME || 'Revisions Requested').trim();
 const RR_YES_VALUES = parseCommaList(process.env.RR_YES_VALUES, 'Yes');
+const RR_STATUS_FIELD_NAME = String(process.env.RR_STATUS_FIELD_NAME || '').trim(); // optional exact field name (e.g. "Status")
 const RR_CHECK_CRON = process.env.RR_CHECK_CRON || '0 9 * * *';
 const RR_CHANNEL_ID = process.env.RR_CHANNEL_ID || process.env.REVISIONS_CHANNEL_ID;
 const PING_ON_REVISIONS = String(process.env.PING_ON_REVISIONS || '').toLowerCase() !== 'false';
@@ -121,13 +122,13 @@ function loadRRState() {
         if (!fs.existsSync(RR_STORAGE_FILE)) return;
         const raw = JSON.parse(fs.readFileSync(RR_STORAGE_FILE, 'utf8'));
         // Supported shapes:
-        // - { "<issueUrl>": true/false, ... } (current)
-        // - [ "<issueUrl>", ... ]             (legacy; treated as "already notified")
+        // - { "<issueUrl>": true/false, ... } (current; stores last-seen effective RR state)
+        // - [ "<issueUrl>", ... ]             (legacy; treated as "RR=true")
         // - { "<issueUrl>": <number>, ... }   (older legacy; ignored so we can re-baseline)
         const next = new Map();
         if (Array.isArray(raw)) {
-            // Legacy format: treat as "already notified" for that URL.
-            for (const url of raw) next.set(String(url), -1);
+            // Legacy format: treat as "RR=true" for that URL.
+            for (const url of raw) next.set(String(url), true);
         } else if (raw && typeof raw === 'object') {
             // If this looks like the old "comment id" map, ignore it and re-baseline.
             const values = Object.values(raw);
@@ -138,12 +139,14 @@ function loadRRState() {
                 console.log('Legacy rr-state.json detected (comment-id format). Will re-baseline RR state.');
                 return;
             }
-            for (const [url, commentId] of Object.entries(raw)) {
-                if (commentId === -1) {
-                    next.set(String(url), -1);
+            for (const [url, value] of Object.entries(raw)) {
+                // Some older versions used -1 as a sentinel meaning "already notified";
+                // for transition-based tracking, treat it as last-seen true.
+                if (value === -1) {
+                    next.set(String(url), true);
                     continue;
                 }
-                next.set(String(url), Boolean(commentId));
+                next.set(String(url), Boolean(value));
             }
         }
         previousRRByUrl = next;
@@ -331,13 +334,13 @@ function normalizeStatusName(name) {
     return String(name || '').trim().toLowerCase();
 }
 
-function getStatusFromItem(item) {
+function getStatusFromItem(item, preferredFieldNameRaw = '') {
     // Returns { fieldName, valueName } or null
     const singleSelectFields = (item?.fieldValues?.nodes || []).filter(
         node => node?.field?.name && typeof node?.name === 'string'
     );
 
-    const desiredFieldName = IDLE_STATUS_FIELD_NAME ? normalizeStatusName(IDLE_STATUS_FIELD_NAME) : '';
+    const desiredFieldName = preferredFieldNameRaw ? normalizeStatusName(preferredFieldNameRaw) : '';
 
     // Prefer explicit configured field name
     if (desiredFieldName) {
@@ -475,7 +478,7 @@ async function sendIdleDevelopersReport() {
     for (const item of items) {
         if (!item?.content) continue;
 
-        const status = getStatusFromItem(item);
+        const status = getStatusFromItem(item, IDLE_STATUS_FIELD_NAME);
         if (!status) continue;
 
         if (!targetStatuses.has(normalizeStatusName(status.valueName))) continue;
@@ -537,11 +540,11 @@ async function checkRevisionsRequested() {
     const rrDebug = String(process.env.RR_DEBUG || '').toLowerCase() === 'true';
     let total = 0;
     let skippedNonIssue = 0;
+    let skippedNoUrl = 0;
     let skippedNoStatus = 0;
-    let skippedWrongStatus = 0;
     let skippedNoRRField = 0;
-    let skippedRRNo = 0;
     let scanned = 0;
+    const currentEffectiveRRByUrl = new Map();
 
     for (const item of items) {
         if (!item?.content) continue;
@@ -552,43 +555,39 @@ async function checkRevisionsRequested() {
             continue;
         }
 
-        const status = getStatusFromItem(item);
-        if (!status) {
-            skippedNoStatus++;
-            continue;
-        }
-        if (targetStatuses.size > 0 && !targetStatuses.has(normalizeStatusName(status.valueName))) {
-            skippedWrongStatus++;
-            continue;
-        }
-
         const url = String(item.content.url);
+        if (!url) {
+            skippedNoUrl++;
+            continue;
+        }
         scanned++;
+
+        const status = getStatusFromItem(item, RR_STATUS_FIELD_NAME);
+        if (!status) skippedNoStatus++;
+        const isInTargetStatus =
+            targetStatuses.size === 0 ||
+            (status && targetStatuses.has(normalizeStatusName(status.valueName)));
+
         const rrField = getSingleSelectValueByFieldName(item, RR_FIELD_NAME);
-        if (!rrField) {
-            skippedNoRRField++;
-            continue;
+        if (!rrField) skippedNoRRField++;
+        const isRRYes = rrField ? matchesAnyValue(rrField.valueName, RR_YES_VALUES) : false;
+
+        // "Effective RR" means: item is in a target status AND RR field is set to Yes.
+        const effectiveRR = Boolean(isInTargetStatus && isRRYes);
+        currentEffectiveRRByUrl.set(url, effectiveRR);
+
+        // On normal runs: notify on transition false -> true.
+        const prev = Boolean(previousRRByUrl.get(url));
+        if (effectiveRR && !prev) {
+            // status/rrField may be null if fields are misconfigured; still keep them for debugging/embeds.
+            newlyRR.push({ item, status, rrField });
         }
-
-        const isRRYes = matchesAnyValue(rrField.valueName, RR_YES_VALUES);
-        if (!isRRYes) {
-            skippedRRNo++;
-            continue;
-        }
-
-        const prev = previousRRByUrl.get(url);
-        if (prev === -1) continue; // legacy "already notified" sentinel
-        if (prev === true) continue; // already notified RR=true
-
-        newlyRR.push({ item, status, rrField });
     }
 
     // Baseline behavior:
     // If we have no stored state, don't notify for existing RR items; just record current state and start "going forward".
     if (!hasLoadedRRState && SUPPRESS_INITIAL_RR_NOTIFICATIONS) {
-        for (const { item: it } of newlyRR) {
-            previousRRByUrl.set(String(it.content.url), true);
-        }
+        previousRRByUrl = currentEffectiveRRByUrl;
         saveRRState();
         hasLoadedRRState = true;
         console.log('No previous RR state found. Baseline created; skipping initial RR notifications.');
@@ -597,9 +596,10 @@ async function checkRevisionsRequested() {
 
     for (const { item, status, rrField } of newlyRR) {
         await sendRevisionsRequestedNotification(item, status, rrField);
-        previousRRByUrl.set(String(item.content.url), true);
     }
 
+    // Persist the last-seen effective RR state for all issues currently in the project.
+    previousRRByUrl = currentEffectiveRRByUrl;
     saveRRState();
     hasLoadedRRState = true;
 
@@ -610,10 +610,10 @@ async function checkRevisionsRequested() {
             consideredWithContent: total,
             scanned,
             skippedNonIssue,
+            skippedNoUrl,
             skippedNoStatus,
-            skippedWrongStatus,
             skippedNoRRField,
-            skippedRRNo,
+            statusFieldName: RR_STATUS_FIELD_NAME || '(auto)',
             rrFieldName: RR_FIELD_NAME,
             rrYesValues: RR_YES_VALUES,
             rrStatuses: RR_STATUS_NAMES

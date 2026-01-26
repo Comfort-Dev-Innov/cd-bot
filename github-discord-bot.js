@@ -255,6 +255,10 @@ async function getProjectItems() {
                                 }
                             }
                         }
+                        ... on DraftIssue {
+                            __typename
+                            title
+                        }
                     }
                 }
             }
@@ -536,83 +540,55 @@ async function checkRevisionsRequested() {
 
     const items = await getProjectItems();
     const targetStatuses = new Set(RR_STATUS_NAMES.map(normalizeStatusName));
-    const newlyRR = [];
+    const rrMatches = [];
     const rrDebug = String(process.env.RR_DEBUG || '').toLowerCase() === 'true';
     let total = 0;
-    let skippedNonIssue = 0;
-    let skippedNoUrl = 0;
-    let skippedNoStatus = 0;
-    let skippedNoRRField = 0;
     let scanned = 0;
     const currentEffectiveRRByUrl = new Map();
 
     for (const item of items) {
-        if (!item?.content) continue;
         total++;
 
-        if (item.content.__typename && item.content.__typename !== 'Issue') {
-            skippedNonIssue++;
-            continue;
-        }
-
-        const url = String(item.content.url);
-        if (!url) {
-            skippedNoUrl++;
-            continue;
-        }
+        // Prefer the canonical Issue/PR URL as the stable key; otherwise fall back to the project item id.
+        const url = item?.content?.url ? String(item.content.url) : '';
+        const key = url || `projectItem:${String(item?.id || '')}`;
+        if (!key || key === 'projectItem:') continue;
         scanned++;
 
         const status = getStatusFromItem(item, RR_STATUS_FIELD_NAME);
-        if (!status) skippedNoStatus++;
         const isInTargetStatus =
             targetStatuses.size === 0 ||
             (status && targetStatuses.has(normalizeStatusName(status.valueName)));
 
         const rrField = getSingleSelectValueByFieldName(item, RR_FIELD_NAME);
-        if (!rrField) skippedNoRRField++;
         const isRRYes = rrField ? matchesAnyValue(rrField.valueName, RR_YES_VALUES) : false;
 
-        // "Effective RR" means: item is in a target status AND RR field is set to Yes.
+        // "Effective RR" means: item is in a target status AND RR field is set to a "yes" value.
         const effectiveRR = Boolean(isInTargetStatus && isRRYes);
-        currentEffectiveRRByUrl.set(url, effectiveRR);
+        currentEffectiveRRByUrl.set(key, effectiveRR);
 
-        // On normal runs: notify on transition false -> true.
-        const prev = Boolean(previousRRByUrl.get(url));
-        if (effectiveRR && !prev) {
-            // status/rrField may be null if fields are misconfigured; still keep them for debugging/embeds.
-            newlyRR.push({ item, status, rrField });
+        // Always notify for all matching RR items on every run.
+        if (effectiveRR) {
+            rrMatches.push({ item, status, rrField });
         }
     }
 
-    // Baseline behavior:
-    // If we have no stored state, don't notify for existing RR items; just record current state and start "going forward".
-    if (!hasLoadedRRState && SUPPRESS_INITIAL_RR_NOTIFICATIONS) {
-        previousRRByUrl = currentEffectiveRRByUrl;
-        saveRRState();
-        hasLoadedRRState = true;
-        console.log('No previous RR state found. Baseline created; skipping initial RR notifications.');
-        return;
-    }
-
-    for (const { item, status, rrField } of newlyRR) {
+    for (const { item, status, rrField } of rrMatches) {
         await sendRevisionsRequestedNotification(item, status, rrField);
     }
 
-    // Persist the last-seen effective RR state for all issues currently in the project.
+    // Persist last scan (useful for debugging / future transition logic).
     previousRRByUrl = currentEffectiveRRByUrl;
     saveRRState();
     hasLoadedRRState = true;
 
-    console.log(`Found ${newlyRR.length} newly marked RR items`);
+    console.log(`Found ${rrMatches.length} RR items (reported every run)`);
     if (rrDebug) {
         console.log('RR debug:', {
             fetchedItems: items.length,
-            consideredWithContent: total,
+            consideredItems: total,
             scanned,
-            skippedNonIssue,
-            skippedNoUrl,
-            skippedNoStatus,
-            skippedNoRRField,
+            rrCount: rrMatches.length,
             statusFieldName: RR_STATUS_FIELD_NAME || '(auto)',
             rrFieldName: RR_FIELD_NAME,
             rrYesValues: RR_YES_VALUES,
@@ -811,7 +787,7 @@ async function sendDeadlineNotification(item, when, color) {
 }
 
 async function sendRevisionsRequestedNotification(item, status, rrField) {
-    const content = item.content;
+    const content = item?.content || {};
     const assignees = content.assignees?.nodes || [];
     const assigneeLogins = assignees.map(a => a.login).filter(Boolean);
     const targets = getTargetsForGithubLogins(assigneeLogins);
@@ -825,16 +801,24 @@ async function sendRevisionsRequestedNotification(item, status, rrField) {
     const mentionText = PING_ON_REVISIONS ? getMentionsForGithubLogins(assigneeLogins) : '';
     const contentText = mentionText ? `${mentionText} 🔄 Revisions requested` : '🔄 Revisions requested';
 
+    const safeTitle = content?.title ? String(content.title) : `Project item ${String(item?.id || '')}`.trim();
+    const safeUrl = content?.url ? String(content.url) : '';
+    const safeRepo = content?.repository?.name ? String(content.repository.name) : 'Unknown';
+    const safeNumber = typeof content?.number === 'number' ? `#${content.number}` : 'N/A';
+    const safeType = content?.__typename ? String(content.__typename) : 'Unknown';
+
     const embed = new EmbedBuilder()
         .setColor('#b57edc')
-        .setTitle(`🔄 Revisions Requested: ${content.title}`)
-        .setURL(content.url)
+        .setTitle(`🔄 Revisions Requested: ${safeTitle}`)
         .addFields(
-            { name: 'Repository', value: content.repository.name, inline: true },
-            { name: 'Issue/PR', value: `#${content.number}`, inline: true },
+            { name: 'Type', value: safeType, inline: true },
+            { name: 'Repository', value: safeRepo, inline: true },
+            { name: 'Issue/PR', value: safeNumber, inline: true },
             { name: 'Status', value: status?.valueName ? String(status.valueName) : 'Unknown', inline: true }
         )
         .setTimestamp();
+
+    if (safeUrl) embed.setURL(safeUrl);
 
     embed.addFields({
         name: rrField?.fieldName ? rrField.fieldName : 'Revisions Requested',

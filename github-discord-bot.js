@@ -186,10 +186,16 @@ async function getProjectItems() {
         return [];
     }
 
+    // NOTE: We paginate `items(first: 100)` because projects can grow beyond 100 items.
+    // Without pagination, checks like idle/dev deadlines can look "stale" as soon as new items fall off page 1.
     const queryBody = `
         projectV2(number: $number) {
             id
-            items(first: 100) {
+            items(first: 100, after: $after) {
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
                 nodes {
                     id
                     fieldValues(first: 50) {
@@ -265,20 +271,48 @@ async function getProjectItems() {
         }
     `;
 
+    async function fetchAllPages(ownerType) {
+        const maxPages = parseInt(process.env.PROJECT_ITEMS_MAX_PAGES || '50', 10); // 50 * 100 = 5000 items safety cap
+        const results = [];
+        let after = null;
+
+        for (let page = 1; page <= maxPages; page++) {
+            const baseQuery =
+                ownerType === 'org'
+                    ? `
+                query($login: String!, $number: Int!, $after: String) {
+                    organization(login: $login) {
+                        ${queryBody}
+                    }
+                }
+                `
+                    : `
+                query($login: String!, $number: Int!, $after: String) {
+                    user(login: $login) {
+                        ${queryBody}
+                    }
+                }
+                `;
+
+            const project = await octokit.graphql(baseQuery, { login: GITHUB_OWNER, number, after });
+            const container =
+                ownerType === 'org' ? project?.organization?.projectV2 : project?.user?.projectV2;
+
+            const nodes = container?.items?.nodes || [];
+            results.push(...nodes);
+
+            const pageInfo = container?.items?.pageInfo;
+            if (!pageInfo?.hasNextPage) break;
+            after = pageInfo.endCursor;
+            if (!after) break;
+        }
+
+        return results;
+    }
+
     // Try organization-owned project first
     try {
-        const project = await octokit.graphql(
-            `
-            query($login: String!, $number: Int!) {
-                organization(login: $login) {
-                    ${queryBody}
-                }
-            }
-            `,
-            { login: GITHUB_OWNER, number }
-        );
-
-        return project?.organization?.projectV2?.items?.nodes || [];
+        return await fetchAllPages('org');
     } catch (error) {
         const message = error?.message || '';
         if (message.includes('Could not resolve to an Organization')) {
@@ -292,18 +326,7 @@ async function getProjectItems() {
 
     // Fallback: user-owned project
     try {
-        const project = await octokit.graphql(
-            `
-            query($login: String!, $number: Int!) {
-                user(login: $login) {
-                    ${queryBody}
-                }
-            }
-            `,
-            { login: GITHUB_OWNER, number }
-        );
-
-        return project?.user?.projectV2?.items?.nodes || [];
+        return await fetchAllPages('user');
     } catch (error) {
         console.error('Error fetching user project items:', error);
         return [];
@@ -472,66 +495,99 @@ function getAllKnownDevelopers() {
     return Array.from(all).sort((a, b) => a.localeCompare(b));
 }
 
-async function sendIdleDevelopersReport() {
+async function sendIdleDevelopersReport(context = {}) {
     if (!ENABLE_IDLE_REPORT) return;
 
-    const items = await getProjectItems();
-    const targetStatuses = new Set(IDLE_STATUS_NAMES.map(normalizeStatusName));
-    const activeAssignees = new Set();
+    const idleDebug = String(process.env.IDLE_DEBUG || '').toLowerCase() === 'true';
+    const source = String(context?.source || 'unknown');
+    const startedAt = Date.now();
 
-    for (const item of items) {
-        if (!item?.content) continue;
+    try {
+        console.log(
+            `[idle] run start (source=${source}) statuses="${IDLE_STATUS_NAMES.join(', ')}" statusField="${
+                IDLE_STATUS_FIELD_NAME || '(auto)'
+            }"`
+        );
 
-        const status = getStatusFromItem(item, IDLE_STATUS_FIELD_NAME);
-        if (!status) continue;
+        const items = await getProjectItems();
+        console.log(`[idle] fetched project items=${items.length} (${Date.now() - startedAt}ms elapsed)`);
 
-        if (!targetStatuses.has(normalizeStatusName(status.valueName))) continue;
+        const targetStatuses = new Set(IDLE_STATUS_NAMES.map(normalizeStatusName));
+        const activeAssignees = new Set();
 
-        const assignees = item.content.assignees?.nodes || [];
-        for (const a of assignees) {
-            if (a?.login) activeAssignees.add(a.login);
+        for (const item of items) {
+            if (!item?.content) continue;
+
+            const status = getStatusFromItem(item, IDLE_STATUS_FIELD_NAME);
+            if (!status) continue;
+
+            if (!targetStatuses.has(normalizeStatusName(status.valueName))) continue;
+
+            const assignees = item.content.assignees?.nodes || [];
+            for (const a of assignees) {
+                if (a?.login) activeAssignees.add(a.login);
+            }
         }
+
+        const developers = getAllKnownDevelopers();
+        const idle = developers.filter(login => !activeAssignees.has(login));
+
+        if (idleDebug) {
+            console.log('[idle] debug snapshot:', {
+                knownDevelopers: developers.length,
+                activeAssignees: activeAssignees.size,
+                idleCount: idle.length,
+                activeAssigneesSample: Array.from(activeAssignees).sort().slice(0, 25)
+            });
+        }
+
+        const embed = new EmbedBuilder()
+            .setColor('#5865F2')
+            .setTitle('📋 Daily idle devs report')
+            .addFields(
+                { name: 'Statuses checked', value: IDLE_STATUS_NAMES.join(', '), inline: false },
+                { name: 'Known devs', value: String(developers.length), inline: true },
+                { name: 'Active (has ticket)', value: String(activeAssignees.size), inline: true },
+                { name: 'Idle (no ticket)', value: String(idle.length), inline: true }
+            )
+            .setTimestamp();
+
+        if (idle.length > 0) {
+            embed.addFields({
+                name: 'Idle devs (GitHub logins)',
+                value: idle.map(u => `- ${u}`).join('\n').slice(0, 1024) // Discord field limit safety
+            });
+        } else {
+            embed.addFields({ name: 'Idle devs (GitHub logins)', value: 'None 🎉' });
+        }
+
+        const payload = { embeds: [embed] };
+
+        if (IDLE_REPORT_CHANNEL_ID) {
+            console.log(`[idle] sending report -> channel:${String(IDLE_REPORT_CHANNEL_ID)}`);
+            await sendToTarget({ type: 'channel', id: String(IDLE_REPORT_CHANNEL_ID) }, payload);
+            console.log(`[idle] run ok (${Date.now() - startedAt}ms total)`);
+            return;
+        }
+        if (IDLE_REPORT_DISCORD_USER_ID) {
+            console.log(`[idle] sending report -> dm:${String(IDLE_REPORT_DISCORD_USER_ID)}`);
+            await sendToTarget({ type: 'dm', userId: String(IDLE_REPORT_DISCORD_USER_ID) }, payload);
+            console.log(`[idle] run ok (${Date.now() - startedAt}ms total)`);
+            return;
+        }
+        if (DEFAULT_CHANNEL_ID) {
+            console.log(`[idle] sending report -> channel:${String(DEFAULT_CHANNEL_ID)} (default)`);
+            await sendToTarget({ type: 'channel', id: String(DEFAULT_CHANNEL_ID) }, payload);
+            console.log(`[idle] run ok (${Date.now() - startedAt}ms total)`);
+            return;
+        }
+
+        console.log('Idle report enabled, but no report recipient configured (set IDLE_REPORT_* or DISCORD_CHANNEL_ID).');
+        console.log(`[idle] run ended (no recipient) (${Date.now() - startedAt}ms total)`);
+    } catch (error) {
+        console.error(`[idle] run failed (source=${source})`, error);
+        throw error;
     }
-
-    const developers = getAllKnownDevelopers();
-    const idle = developers.filter(login => !activeAssignees.has(login));
-
-    const embed = new EmbedBuilder()
-        .setColor('#5865F2')
-        .setTitle('📋 Daily idle devs report')
-        .addFields(
-            { name: 'Statuses checked', value: IDLE_STATUS_NAMES.join(', '), inline: false },
-            { name: 'Known devs', value: String(developers.length), inline: true },
-            { name: 'Active (has ticket)', value: String(activeAssignees.size), inline: true },
-            { name: 'Idle (no ticket)', value: String(idle.length), inline: true }
-        )
-        .setTimestamp();
-
-    if (idle.length > 0) {
-        embed.addFields({
-            name: 'Idle devs (GitHub logins)',
-            value: idle.map(u => `- ${u}`).join('\n').slice(0, 1024) // Discord field limit safety
-        });
-    } else {
-        embed.addFields({ name: 'Idle devs (GitHub logins)', value: 'None 🎉' });
-    }
-
-    const payload = { embeds: [embed] };
-
-    if (IDLE_REPORT_CHANNEL_ID) {
-        await sendToTarget({ type: 'channel', id: String(IDLE_REPORT_CHANNEL_ID) }, payload);
-        return;
-    }
-    if (IDLE_REPORT_DISCORD_USER_ID) {
-        await sendToTarget({ type: 'dm', userId: String(IDLE_REPORT_DISCORD_USER_ID) }, payload);
-        return;
-    }
-    if (DEFAULT_CHANNEL_ID) {
-        await sendToTarget({ type: 'channel', id: String(DEFAULT_CHANNEL_ID) }, payload);
-        return;
-    }
-
-    console.log('Idle report enabled, but no report recipient configured (set IDLE_REPORT_* or DISCORD_CHANNEL_ID).');
 }
 
 async function checkRevisionsRequested() {
@@ -880,7 +936,9 @@ if (ENABLE_RR_MONITORING) {
 // Daily idle dev report (who has no assigned ticket in Todo/In Progress)
 if (ENABLE_IDLE_REPORT) {
     cron.schedule(IDLE_REPORT_CRON, () => {
-        sendIdleDevelopersReport();
+        sendIdleDevelopersReport({ source: 'cron' }).catch(err => {
+            console.error('[idle] cron invocation failed', err);
+        });
     });
 }
 
@@ -898,7 +956,13 @@ discord.on('messageCreate', async (message) => {
 
     if (message.content === '!check-idle' && message.member.permissions.has('Administrator')) {
         await message.reply('Checking for idle devs...');
-        await sendIdleDevelopersReport();
+        try {
+            await sendIdleDevelopersReport({ source: 'manual' });
+        } catch (error) {
+            // Keep the error user-friendly in Discord, but log full details to stdout/stderr.
+            const msg = error?.message ? String(error.message) : 'Unknown error';
+            await message.reply(`Idle report failed. Check bot logs. (${msg})`);
+        }
     }
 
     if (message.content === '!check-rr' && message.member.permissions.has('Administrator')) {

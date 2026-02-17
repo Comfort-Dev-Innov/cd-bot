@@ -186,8 +186,6 @@ async function getProjectItems() {
         return [];
     }
 
-    // NOTE: We paginate `items(first: 100)` because projects can grow beyond 100 items.
-    // Without pagination, checks like idle/dev deadlines can look "stale" as soon as new items fall off page 1.
     const queryBody = `
         projectV2(number: $number) {
             id

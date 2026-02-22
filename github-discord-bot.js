@@ -4,6 +4,19 @@ const cron = require('node-cron');
 const fs = require('fs');
 const path = require('path');
 
+const express = require("express");
+const app = express();
+
+const PORT = process.env.PORT || 3000;
+
+app.get("/", (req, res) => {
+  res.send("CD Bot is alive.");
+});
+
+app.listen(PORT, () => {
+  console.log("Web server running.");
+});
+
 // Configuration
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;

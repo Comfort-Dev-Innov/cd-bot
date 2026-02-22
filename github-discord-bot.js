@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const { Client, GatewayIntentBits, EmbedBuilder, Events } = require('discord.js');
 const { Octokit } = require('@octokit/rest');
 const cron = require('node-cron');
@@ -993,4 +995,7 @@ discord.on('messageCreate', async (message) => {
 });
 
 // Login to Discord
-discord.login(DISCORD_TOKEN);
+discord.login(DISCORD_TOKEN).catch(err => {
+    console.error('Failed to log in to Discord:', err);
+    process.exit(1);
+});

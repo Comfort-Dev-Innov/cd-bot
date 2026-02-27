@@ -59,7 +59,7 @@ const ENABLE_IDLE_REPORT = String(process.env.ENABLE_IDLE_REPORT || '').toLowerC
 const IDLE_REPORT_DISCORD_USER_ID =
     process.env.IDLE_REPORT_DISCORD_USER_ID || process.env.REPORT_DISCORD_USER_ID || process.env.ADMIN_DISCORD_USER_ID;
 const IDLE_REPORT_CHANNEL_ID = process.env.IDLE_REPORT_CHANNEL_ID || process.env.REPORT_CHANNEL_ID;
-const IDLE_REPORT_CRON = process.env.IDLE_REPORT_CRON || '5 9 * * *'; // default: daily 9:05
+const IDLE_REPORT_CRON = process.env.IDLE_REPORT_CRON || '5 6 * * *'; // default: daily 6:05
 const IDLE_STATUS_NAMES = (process.env.IDLE_STATUS_NAMES || 'Todo,In Progress')
     .split(',')
     .map(s => s.trim())
@@ -71,7 +71,7 @@ const RR_STATUS_NAMES = parseCommaList(process.env.RR_STATUS_NAMES, 'In Progress
 const RR_FIELD_NAME = String(process.env.RR_FIELD_NAME || 'Revisions Requested').trim();
 const RR_YES_VALUES = parseCommaList(process.env.RR_YES_VALUES, 'Yes');
 const RR_STATUS_FIELD_NAME = String(process.env.RR_STATUS_FIELD_NAME || '').trim(); // optional exact field name (e.g. "Status")
-const RR_CHECK_CRON = process.env.RR_CHECK_CRON || '0 9 * * *';
+const RR_CHECK_CRON = process.env.RR_CHECK_CRON || '0 6 * * *';
 const RR_CHANNEL_ID = process.env.RR_CHANNEL_ID || process.env.REVISIONS_CHANNEL_ID;
 const PING_ON_REVISIONS = String(process.env.PING_ON_REVISIONS || '').toLowerCase() !== 'false';
 const SUPPRESS_INITIAL_RR_NOTIFICATIONS =
@@ -83,8 +83,28 @@ const discord = new Client({
 });
 
 const octokit = new Octokit({
-    auth: GITHUB_TOKEN
+    auth: GITHUB_TOKEN,
+    request: { timeout: 20000 }
 });
+
+async function retryWithBackoff(fn, retries = 3, baseDelay = 3000) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            return await fn();
+        } catch (error) {
+            const isRetryable =
+                error?.status === 500 ||
+                error?.status === 502 ||
+                error?.status === 503 ||
+                error?.status === 429 ||
+                /timeout|ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up/i.test(error?.message || '');
+            if (attempt === retries || !isRetryable) throw error;
+            const delay = baseDelay * attempt;
+            console.warn(`[github] API attempt ${attempt}/${retries} failed (${error.message}). Retrying in ${delay}ms...`);
+            await new Promise(res => setTimeout(res, delay));
+        }
+    }
+}
 
 // Store user mappings (GitHub username -> Discord user ID)
 const userMappings = new Map();
@@ -294,7 +314,9 @@ async function getProjectItems() {
                 }
                 `;
 
-            const project = await octokit.graphql(baseQuery, { login: GITHUB_OWNER, number, after });
+            const project = await retryWithBackoff(() =>
+                octokit.graphql(baseQuery, { login: GITHUB_OWNER, number, after })
+            );
             const container =
                 ownerType === 'org' ? project?.organization?.projectV2 : project?.user?.projectV2;
 
@@ -916,21 +938,21 @@ discord.once(Events?.ClientReady ?? 'clientReady', () => {
     }
 });
 
-// Schedule deadline checks - runs every day at 9 AM
-cron.schedule('0 9 * * *', () => {
+// Schedule deadline checks - runs every day at 6 AM PHT
+cron.schedule('0 6 * * *', () => {
     checkDeadlinesAndNotify();
-});
+}, { timezone: 'Asia/Manila' });
 
 // Check for new assignments every 15 minutes
 cron.schedule('*/15 * * * *', () => {
     checkNewAssignments();
-});
+}, { timezone: 'Asia/Manila' });
 
 // Check for revisions requested (RR) periodically
 if (ENABLE_RR_MONITORING) {
     cron.schedule(RR_CHECK_CRON, () => {
         checkRevisionsRequested();
-    });
+    }, { timezone: 'Asia/Manila' });
 }
 
 // Daily idle dev report (who has no assigned ticket in Todo/In Progress)
@@ -939,7 +961,7 @@ if (ENABLE_IDLE_REPORT) {
         sendIdleDevelopersReport({ source: 'cron' }).catch(err => {
             console.error('[idle] cron invocation failed', err);
         });
-    });
+    }, { timezone: 'Asia/Manila' });
 }
 
 // You can also add a manual trigger command

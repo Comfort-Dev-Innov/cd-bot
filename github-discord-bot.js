@@ -19,18 +19,8 @@ const PROJECT_NUMBER = process.env.PROJECT_NUMBER;
 // Routing config:
 // - USER_MAPPINGS: GitHub login -> Discord user ID (for @mentions + DM fallback)
 // - DEV_CHANNEL_MAPPINGS: GitHub login -> Discord channel ID (send to each dev's channel)
-const DEV_CHANNEL_MAPPINGS_ENV = process.env.DEV_CHANNEL_MAPPINGS || process.env.USER_CHANNEL_MAPPINGS;
+// These are now loaded from devs.json (see below), with env vars as a fallback.
 const devChannelMappings = new Map();
-if (DEV_CHANNEL_MAPPINGS_ENV) {
-    try {
-        const mappings = JSON.parse(DEV_CHANNEL_MAPPINGS_ENV);
-        Object.entries(mappings).forEach(([github, channelId]) => {
-            if (channelId) devChannelMappings.set(github, String(channelId));
-        });
-    } catch (e) {
-        console.error('Invalid DEV_CHANNEL_MAPPINGS JSON:', e);
-    }
-}
 
 // Behavior toggles
 const RUN_ON_STARTUP = String(process.env.RUN_ON_STARTUP || '').toLowerCase() === 'true';
@@ -67,6 +57,9 @@ const IDLE_STATUS_NAMES = (process.env.IDLE_STATUS_NAMES || 'Todo,In Progress')
 const IDLE_STATUS_FIELD_NAME = (process.env.IDLE_STATUS_FIELD_NAME || '').trim(); // optional: exact field name (e.g. "Status")
 
 const ENABLE_RR_MONITORING = String(process.env.ENABLE_RR_MONITORING || '').toLowerCase() !== 'false';
+const ENABLE_ASS_MONITORING = String(process.env.ENABLE_ASS_MONITORING || '').toLowerCase() !== 'false';
+const ASS_STATUS_NAMES = parseCommaList(process.env.ASS_STATUS_NAMES, 'Todo');
+const ASS_STATUS_FIELD_NAME = String(process.env.ASS_STATUS_FIELD_NAME || '').trim(); // optional exact field name (e.g. "Status")
 const RR_STATUS_NAMES = parseCommaList(process.env.RR_STATUS_NAMES, 'In Progress');
 const RR_FIELD_NAME = String(process.env.RR_FIELD_NAME || 'Revisions Requested').trim();
 const RR_YES_VALUES = parseCommaList(process.env.RR_YES_VALUES, 'Yes');
@@ -108,12 +101,46 @@ async function retryWithBackoff(fn, retries = 3, baseDelay = 3000) {
 
 // Store user mappings (GitHub username -> Discord user ID)
 const userMappings = new Map();
-// Load from environment or configuration file
-if (process.env.USER_MAPPINGS) {
-    const mappings = JSON.parse(process.env.USER_MAPPINGS);
-    Object.entries(mappings).forEach(([github, discord]) => {
-        userMappings.set(github, discord);
-    });
+
+// Load dev mappings from devs.json (primary source), then fall back to env vars.
+const DEVS_FILE = path.join(__dirname, 'devs.json');
+if (fs.existsSync(DEVS_FILE)) {
+    try {
+        const devs = JSON.parse(fs.readFileSync(DEVS_FILE, 'utf8'));
+        for (const dev of devs) {
+            if (!dev.githubLogin) continue;
+            // Skip inactive devs — they won't receive any notifications.
+            if (dev.active === false) continue;
+            if (dev.discordId) userMappings.set(dev.githubLogin, String(dev.discordId));
+            if (dev.channelId) devChannelMappings.set(dev.githubLogin, String(dev.channelId));
+        }
+        console.log(`Loaded ${userMappings.size} active dev(s) from devs.json`);
+    } catch (e) {
+        console.error('Failed to parse devs.json:', e);
+    }
+} else {
+    // Fallback: legacy env-var mappings
+    if (process.env.USER_MAPPINGS) {
+        try {
+            const mappings = JSON.parse(process.env.USER_MAPPINGS);
+            Object.entries(mappings).forEach(([github, discordId]) => {
+                userMappings.set(github, String(discordId));
+            });
+        } catch (e) {
+            console.error('Invalid USER_MAPPINGS JSON:', e);
+        }
+    }
+    const DEV_CHANNEL_MAPPINGS_ENV = process.env.DEV_CHANNEL_MAPPINGS || process.env.USER_CHANNEL_MAPPINGS;
+    if (DEV_CHANNEL_MAPPINGS_ENV) {
+        try {
+            const mappings = JSON.parse(DEV_CHANNEL_MAPPINGS_ENV);
+            Object.entries(mappings).forEach(([github, channelId]) => {
+                if (channelId) devChannelMappings.set(github, String(channelId));
+            });
+        } catch (e) {
+            console.error('Invalid DEV_CHANNEL_MAPPINGS JSON:', e);
+        }
+    }
 }
 
 // Store previous state of assignments (issue/PR URL -> assignee usernames)
@@ -722,16 +749,25 @@ async function checkDeadlinesAndNotify() {
 }
 
 async function checkNewAssignments() {
+    if (!ENABLE_ASS_MONITORING) return;
     console.log('Checking for new assignments...');
     
     const items = await getProjectItems();
     const currentAssignments = new Map();
     const newAssignments = [];
+    const targetStatuses = new Set(ASS_STATUS_NAMES.map(normalizeStatusName));
 
     // Build current state
     items.forEach(item => {
         if (!item.content) return;
-        
+
+        const status = getStatusFromItem(item, ASS_STATUS_FIELD_NAME);
+        const isInTargetStatus =
+            targetStatuses.size === 0 ||
+            (status && matchesAnyValue(status.valueName, ASS_STATUS_NAMES));
+
+        if (!isInTargetStatus) return;
+
         const content = item.content;
         const assignees = content.assignees.nodes.map(a => a.login);
         currentAssignments.set(content.url, assignees);
@@ -931,7 +967,7 @@ discord.once(Events?.ClientReady ?? 'clientReady', () => {
     // Opt-in if you want a run immediately at startup.
     if (RUN_ON_STARTUP) {
         checkDeadlinesAndNotify();
-        checkNewAssignments();
+        if (ENABLE_ASS_MONITORING) checkNewAssignments();
         checkRevisionsRequested();
     } else {
         console.log('Startup checks skipped (RUN_ON_STARTUP=false). Waiting for scheduled checks.');
@@ -944,9 +980,11 @@ cron.schedule('0 6 * * *', () => {
 }, { timezone: 'Asia/Manila' });
 
 // Check for new assignments every 15 minutes
-cron.schedule('*/15 * * * *', () => {
-    checkNewAssignments();
-}, { timezone: 'Asia/Manila' });
+if (ENABLE_ASS_MONITORING) {
+    cron.schedule('*/15 * * * *', () => {
+        checkNewAssignments();
+    }, { timezone: 'Asia/Manila' });
+}
 
 // Check for revisions requested (RR) periodically
 if (ENABLE_RR_MONITORING) {
@@ -972,6 +1010,10 @@ discord.on('messageCreate', async (message) => {
     }
     
     if (message.content === '!check-assignments' && message.member.permissions.has('Administrator')) {
+        if (!ENABLE_ASS_MONITORING) {
+            await message.reply('Assignment monitoring is disabled.');
+            return;
+        }
         await message.reply('Checking for new assignments...');
         await checkNewAssignments();
     }
